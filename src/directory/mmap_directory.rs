@@ -61,6 +61,18 @@ fn open_mmap(full_path: &Path) -> Result<Option<Mmap>, OpenReadError> {
     Ok(mmap_opt)
 }
 
+fn mmap_file(file: File, logical_path: &Path) -> Result<Option<Mmap>, OpenReadError> {
+    let meta_data = file
+        .metadata()
+        .map_err(|io_err| OpenReadError::wrap_io_error(io_err, logical_path.to_owned()))?;
+    if meta_data.len() == 0 {
+        return Ok(None);
+    }
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|io_err| OpenReadError::wrap_io_error(io_err, logical_path.to_owned()))?;
+    Ok(Some(mmap))
+}
+
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct CacheCounters {
     /// Number of time the cache prevents to call `mmap`
@@ -146,6 +158,29 @@ impl MmapCache {
             mmap_arc
         }))
     }
+
+    #[cfg(unix)]
+    fn get_mmap_from_file(
+        &mut self,
+        logical_path: &Path,
+        file: File,
+    ) -> Result<Option<ArcBytes>, OpenReadError> {
+        if let Some(mmap_weak) = self.cache.get(logical_path) {
+            if let Some(mmap_arc) = mmap_weak.upgrade() {
+                self.counters.hit += 1;
+                return Ok(Some(mmap_arc));
+            }
+        }
+        self.cache.remove(logical_path);
+        self.counters.miss += 1;
+        let mmap_opt = mmap_file(file, logical_path)?;
+        Ok(mmap_opt.map(|mmap| {
+            let mmap_arc: ArcBytes = Arc::new(mmap);
+            self.cache
+                .insert(logical_path.to_owned(), Arc::downgrade(&mmap_arc));
+            mmap_arc
+        }))
+    }
 }
 
 /// Directory storing data in files, read via mmap.
@@ -166,10 +201,105 @@ pub struct MmapDirectory {
 }
 
 struct MmapDirectoryInner {
-    root_path: PathBuf,
+    root: DirectoryRoot,
     mmap_cache: RwLock<MmapCache>,
     _temp_directory: Option<TempDir>,
     watcher: FileWatcher,
+}
+
+#[derive(Clone)]
+enum DirectoryRoot {
+    Path(PathBuf),
+    #[cfg(unix)]
+    Capability(Arc<File>),
+}
+
+#[cfg(unix)]
+fn capability_name(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if parent.as_os_str().is_empty() => name,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capability directory only accepts flat child names",
+            ));
+        }
+    };
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in child name"))
+}
+
+#[cfg(unix)]
+fn capability_open(
+    dir: &File,
+    path: &Path,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> io::Result<File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let name = capability_name(path)?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn capability_delete(dir: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let name = capability_name(path)?;
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn capability_rename(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let from = capability_name(from)?;
+    let to = capability_name(to)?;
+    let rc =
+        unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn capability_atomic_write(dir: &File, path: &Path, content: &[u8]) -> io::Result<()> {
+    let temporary = PathBuf::from(format!(".tantivy-atomic-{}", uuid::Uuid::new_v4()));
+    let mut file = capability_open(
+        dir,
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    let result = (|| {
+        file.write_all(content)?;
+        file.flush()?;
+        file.sync_data()?;
+        capability_rename(dir, &temporary, path)?;
+        dir.sync_data()
+    })();
+    if result.is_err() {
+        let _ = capability_delete(dir, &temporary);
+    }
+    result
 }
 
 impl MmapDirectoryInner {
@@ -178,8 +308,25 @@ impl MmapDirectoryInner {
             mmap_cache: RwLock::new(MmapCache::new()),
             _temp_directory: temp_directory,
             watcher: FileWatcher::new(&root_path.join(*META_FILEPATH)),
-            root_path,
+            root: DirectoryRoot::Path(root_path),
         }
+    }
+
+    #[cfg(unix)]
+    fn from_dir(dir: File) -> io::Result<MmapDirectoryInner> {
+        if !dir.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capability is not a directory",
+            ));
+        }
+        let dir = Arc::new(dir);
+        Ok(MmapDirectoryInner {
+            mmap_cache: RwLock::new(MmapCache::new()),
+            _temp_directory: None,
+            watcher: FileWatcher::new_from_dir(dir.clone(), META_FILEPATH.as_ref()),
+            root: DirectoryRoot::Capability(dir),
+        })
     }
 
     fn watch(&self, callback: WatchCallback) -> WatchHandle {
@@ -189,7 +336,11 @@ impl MmapDirectoryInner {
 
 impl fmt::Debug for MmapDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MmapDirectory({:?})", self.inner.root_path)
+        match &self.inner.root {
+            DirectoryRoot::Path(path) => write!(f, "MmapDirectory({path:?})"),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(_) => write!(f, "MmapDirectory(<directory capability>)"),
+        }
     }
 }
 
@@ -235,6 +386,22 @@ impl MmapDirectory {
         Self::open_impl_to_avoid_monomorphization(directory_path.as_ref())
     }
 
+    /// Opens a directory from an already validated directory descriptor.
+    ///
+    /// Unlike [`MmapDirectory::open`], every later operation is relative to the
+    /// captured descriptor and refuses symlink children. Renaming or replacing
+    /// the pathname used to obtain `directory` therefore cannot retarget this
+    /// instance to a different index.
+    #[cfg(unix)]
+    pub fn open_from_dir(directory: File) -> Result<MmapDirectory, OpenDirectoryError> {
+        let inner = MmapDirectoryInner::from_dir(directory).map_err(|error| {
+            OpenDirectoryError::wrap_io_error(error, PathBuf::from("<directory capability>"))
+        })?;
+        Ok(MmapDirectory {
+            inner: Arc::new(inner),
+        })
+    }
+
     #[inline(never)]
     fn open_impl_to_avoid_monomorphization(
         directory_path: &Path,
@@ -271,7 +438,11 @@ impl MmapDirectory {
     /// Joins a relative_path to the directory `root_path`
     /// to create a proper complete `filepath`.
     fn resolve_path(&self, relative_path: &Path) -> PathBuf {
-        self.inner.root_path.join(relative_path)
+        match &self.inner.root {
+            DirectoryRoot::Path(root) => root.join(relative_path),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(_) => relative_path.to_owned(),
+        }
     }
 
     /// Returns some statistical information
@@ -378,8 +549,21 @@ impl Directory for MmapDirectory {
             OpenReadError::wrap_io_error(io_err, path.to_path_buf())
         })?;
 
-        let owned_bytes = mmap_cache
-            .get_mmap(&full_path)?
+        let mmap = match &self.inner.root {
+            DirectoryRoot::Path(_) => mmap_cache.get_mmap(&full_path)?,
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => {
+                let file = capability_open(dir, path, libc::O_RDONLY, 0).map_err(|io_err| {
+                    if io_err.kind() == io::ErrorKind::NotFound {
+                        OpenReadError::FileDoesNotExist(path.to_owned())
+                    } else {
+                        OpenReadError::wrap_io_error(io_err, path.to_owned())
+                    }
+                })?;
+                mmap_cache.get_mmap_from_file(path, file)?
+            }
+        };
+        let owned_bytes = mmap
             .map(|mmap_arc| {
                 let mmap_arc_obj = MmapArc(mmap_arc);
                 OwnedBytes::new(mmap_arc_obj)
@@ -393,7 +577,12 @@ impl Directory for MmapDirectory {
     /// removed before the file is deleted.
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         let full_path = self.resolve_path(path);
-        fs::remove_file(full_path).map_err(|e| {
+        let result = match &self.inner.root {
+            DirectoryRoot::Path(_) => fs::remove_file(full_path),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => capability_delete(dir, path),
+        };
+        result.map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 DeleteError::FileDoesNotExist(path.to_owned())
             } else {
@@ -408,19 +597,36 @@ impl Directory for MmapDirectory {
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         let full_path = self.resolve_path(path);
-        full_path
-            .try_exists()
-            .map_err(|io_err| OpenReadError::wrap_io_error(io_err, path.to_path_buf()))
+        match &self.inner.root {
+            DirectoryRoot::Path(_) => full_path
+                .try_exists()
+                .map_err(|io_err| OpenReadError::wrap_io_error(io_err, path.to_path_buf())),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => match capability_open(dir, path, libc::O_RDONLY, 0) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(OpenReadError::wrap_io_error(error, path.to_owned())),
+            },
+        }
     }
 
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
         debug!("Open Write {:?}", path);
         let full_path = self.resolve_path(path);
 
-        let open_res = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(full_path);
+        let open_res = match &self.inner.root {
+            DirectoryRoot::Path(_) => OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(full_path),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => capability_open(
+                dir,
+                path,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            ),
+        };
 
         let mut file = open_res.map_err(|io_err| {
             if io_err.kind() == io::ErrorKind::AlreadyExists {
@@ -449,7 +655,12 @@ impl Directory for MmapDirectory {
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let full_path = self.resolve_path(path);
         let mut buffer = Vec::new();
-        match File::open(full_path) {
+        let opened = match &self.inner.root {
+            DirectoryRoot::Path(_) => File::open(full_path),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => capability_open(dir, path, libc::O_RDONLY, 0),
+        };
+        match opened {
             Ok(mut file) => {
                 file.read_to_end(&mut buffer).map_err(|io_error| {
                     OpenReadError::wrap_io_error(io_error, path.to_path_buf())
@@ -469,19 +680,28 @@ impl Directory for MmapDirectory {
     fn atomic_write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
         debug!("Atomic Write {:?}", path);
         let full_path = self.resolve_path(path);
-        atomic_write(&full_path, content)?;
-        Ok(())
+        match &self.inner.root {
+            DirectoryRoot::Path(_) => atomic_write(&full_path, content),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => capability_atomic_write(dir, path, content),
+        }
     }
 
     fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
         let full_path = self.resolve_path(&lock.filepath);
         // We make sure that the file exists.
-        let file: File = OpenOptions::new()
-            .write(true)
-            .create(true) //< if the file does not exist yet, create it.
-            .truncate(false)
-            .open(full_path)
-            .map_err(LockError::wrap_io_error)?;
+        let file: File = match &self.inner.root {
+            DirectoryRoot::Path(_) => OpenOptions::new()
+                .write(true)
+                .create(true) //< if the file does not exist yet, create it.
+                .truncate(false)
+                .open(full_path),
+            #[cfg(unix)]
+            DirectoryRoot::Capability(dir) => {
+                capability_open(dir, &lock.filepath, libc::O_RDWR | libc::O_CREAT, 0o600)
+            }
+        }
+        .map_err(LockError::wrap_io_error)?;
         if lock.is_blocking {
             file.lock_exclusive().map_err(LockError::wrap_io_error)?;
         } else {
@@ -509,15 +729,16 @@ impl Directory for MmapDirectory {
 
     #[cfg(not(windows))]
     fn sync_directory(&self) -> Result<(), io::Error> {
-        let mut open_opts = OpenOptions::new();
-
-        // Linux needs read to be set, otherwise returns EINVAL
-        // write must not be set, or it fails with EISDIR
-        open_opts.read(true);
-
-        let fd = open_opts.open(&self.inner.root_path)?;
-        fd.sync_data()?;
-        Ok(())
+        match &self.inner.root {
+            DirectoryRoot::Path(path) => {
+                let mut open_opts = OpenOptions::new();
+                // Linux needs read to be set, otherwise returns EINVAL
+                // write must not be set, or it fails with EISDIR
+                open_opts.read(true);
+                open_opts.open(path)?.sync_data()
+            }
+            DirectoryRoot::Capability(dir) => dir.sync_data(),
+        }
     }
 }
 
@@ -555,6 +776,91 @@ mod tests {
         }
         let readonlymap = mmap_directory.open_read(&path).unwrap();
         assert_eq!(readonlymap.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_roundtrip_survives_root_retarget_and_refuses_symlink_children() {
+        use std::os::unix::fs::{symlink, OpenOptionsExt};
+        use std::sync::{Arc, Barrier};
+
+        let parent = TempDir::new().unwrap();
+        let configured = parent.path().join("index");
+        let captured = parent.path().join("captured");
+        fs::create_dir(&configured).unwrap();
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&configured)
+            .unwrap();
+        let directory = MmapDirectory::open_from_dir(root).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_directory = directory.clone();
+        let writer_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            writer_directory.atomic_write(Path::new("proof"), b"captured")
+        });
+
+        fs::rename(&configured, &captured).unwrap();
+        fs::create_dir(&configured).unwrap();
+        let sentinel = parent.path().join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        symlink(&sentinel, configured.join("proof")).unwrap();
+        barrier.wait();
+        writer.join().unwrap().unwrap();
+
+        assert_eq!(fs::read(captured.join("proof")).unwrap(), b"captured");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        assert!(configured.join("proof").is_symlink());
+
+        symlink(&sentinel, captured.join("poison")).unwrap();
+        assert!(directory.atomic_read(Path::new("poison")).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_index_roundtrip_stays_on_captured_inode_after_barrier() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::{Arc, Barrier};
+
+        let parent = TempDir::new().unwrap();
+        let configured = parent.path().join("index");
+        let captured = parent.path().join("captured");
+        fs::create_dir(&configured).unwrap();
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&configured)
+            .unwrap();
+        let directory = MmapDirectory::open_from_dir(root).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker_directory = directory.clone();
+        let worker = std::thread::spawn(move || {
+            worker_barrier.wait();
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field("text", TEXT);
+            let index = Index::open_or_create(worker_directory, schema.build()).unwrap();
+            let mut writer = index.writer(15_000_000).unwrap();
+            writer
+                .add_document(crate::doc!(text => "captured"))
+                .unwrap();
+            writer.commit().unwrap();
+            index.reader().unwrap().searcher().num_docs()
+        });
+
+        fs::rename(&configured, &captured).unwrap();
+        fs::create_dir(&configured).unwrap();
+        fs::write(configured.join("sentinel"), b"decoy").unwrap();
+        barrier.wait();
+        assert_eq!(worker.join().unwrap(), 1);
+        assert!(captured.join("meta.json").is_file());
+        assert!(!configured.join("meta.json").exists());
+        assert_eq!(fs::read(configured.join("sentinel")).unwrap(), b"decoy");
     }
 
     #[test]

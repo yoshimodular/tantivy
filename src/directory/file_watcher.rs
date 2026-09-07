@@ -1,5 +1,5 @@
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,8 +12,18 @@ use crate::directory::{WatchCallback, WatchCallbackList, WatchHandle};
 const POLLING_INTERVAL: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 500 });
 
 // Watches a file and executes registered callbacks when the file is modified.
+#[derive(Clone)]
+enum WatchedFile {
+    Path(Arc<Path>),
+    #[cfg(unix)]
+    Capability {
+        dir: Arc<fs::File>,
+        path: PathBuf,
+    },
+}
+
 pub struct FileWatcher {
-    path: Arc<Path>,
+    file: WatchedFile,
     callbacks: Arc<WatchCallbackList>,
     state: Arc<AtomicUsize>, // 0: new, 1: runnable, 2: terminated
 }
@@ -21,7 +31,19 @@ pub struct FileWatcher {
 impl FileWatcher {
     pub fn new(path: &Path) -> FileWatcher {
         FileWatcher {
-            path: Arc::from(path),
+            file: WatchedFile::Path(Arc::from(path)),
+            callbacks: Default::default(),
+            state: Default::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new_from_dir(dir: Arc<fs::File>, path: &Path) -> FileWatcher {
+        FileWatcher {
+            file: WatchedFile::Capability {
+                dir,
+                path: path.to_owned(),
+            },
             callbacks: Default::default(),
             state: Default::default(),
         }
@@ -36,7 +58,7 @@ impl FileWatcher {
             return;
         }
 
-        let path = self.path.clone();
+        let file = self.file.clone();
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
 
@@ -46,12 +68,12 @@ impl FileWatcher {
                 let mut current_checksum_opt = None;
 
                 while state.load(Ordering::SeqCst) == 1 {
-                    if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
+                    if let Ok(checksum) = FileWatcher::compute_checksum(&file) {
                         let metafile_has_changed = current_checksum_opt
                             .map(|current_checksum| current_checksum != checksum)
                             .unwrap_or(true);
                         if metafile_has_changed {
-                            info!("Meta file {:?} was modified", path);
+                            info!("Meta file was modified");
                             current_checksum_opt = Some(checksum);
                             // We actually ignore callbacks failing here.
                             // We just wait for the end of their execution.
@@ -71,11 +93,16 @@ impl FileWatcher {
         handle
     }
 
-    fn compute_checksum(path: &Path) -> Result<u32, io::Error> {
-        let reader = match fs::File::open(path) {
+    fn compute_checksum(file: &WatchedFile) -> Result<u32, io::Error> {
+        let opened = match file {
+            WatchedFile::Path(path) => fs::File::open(path),
+            #[cfg(unix)]
+            WatchedFile::Capability { dir, path } => openat_read(dir, path),
+        };
+        let reader = match opened {
             Ok(f) => io::BufReader::new(f),
             Err(e) => {
-                warn!("Failed to open meta file {:?}: {:?}", path, e);
+                warn!("Failed to open watched meta file: {:?}", e);
                 return Err(e);
             }
         };
@@ -87,6 +114,36 @@ impl FileWatcher {
         }
 
         Ok(hasher.finalize())
+    }
+}
+
+#[cfg(unix)]
+fn openat_read(dir: &fs::File, path: &Path) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let name = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if parent.as_os_str().is_empty() => name,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capability path must be flat",
+            ))
+        }
+    };
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in capability path"))?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
     }
 }
 
