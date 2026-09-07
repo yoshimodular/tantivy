@@ -1,7 +1,9 @@
 //! Serialization for [`UntypedExpr`] using a small Lisp-like syntax.
 //!
 //! Calls are lists whose first item is an uppercase function name, while
-//! lowercase identifiers name variables. For example:
+//! lowercase identifiers name variables. Variable names may also contain `.` and `#`
+//! (including as their first character) to represent field paths and calculated-field
+//! names. After the first character, digits and underscores are also accepted. For example:
 //!
 //! ```text
 //! (ADD 1i64 my_col)
@@ -219,10 +221,12 @@ fn is_function_name(name: &str) -> bool {
 }
 
 fn is_variable_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-        && chars.all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+    let mut characters = name.chars();
+    matches!(characters.next(), Some(first) if first.is_ascii_lowercase() || matches!(first, '.' | '#'))
+        && characters.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '.' | '#')
         })
 }
 
@@ -468,6 +472,29 @@ fn is_delimiter(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_field_name_roundtrip() {
+        for field_name in [
+            "custom.duration",
+            "custom.request.duration_2",
+            "#duration",
+            "#custom.duration",
+            "custom.#duration",
+            "duration#raw",
+            ".duration",
+        ] {
+            let variable = UntypedExpr::variable(field_name);
+            assert_eq!(serialize(&variable), field_name);
+            assert_eq!(deserialize(field_name).unwrap(), variable);
+
+            let expression =
+                UntypedExpr::call(Function::Gt, vec![variable, UntypedExpr::literal(1i64)]).unwrap();
+            let serialized = format!("(GT {field_name} 1i64)");
+            assert_eq!(serialize(&expression), serialized);
+            assert_eq!(deserialize(&serialized).unwrap(), expression);
+        }
+    }
 
     #[test]
     fn test_serialize_example() {
