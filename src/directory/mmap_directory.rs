@@ -282,30 +282,36 @@ fn capability_child_has_inode(dir: &File, path: &Path, expected: (u64, u64)) -> 
 }
 
 #[cfg(unix)]
-fn capability_delete_if_same_inode(
-    dir: &File,
-    path: &Path,
-    expected: (u64, u64),
-) -> io::Result<()> {
-    // Un cleanup no puede borrar un temporal cuyo nombre ya fue retargeteado.
-    // La identidad se vuelve a acreditar justo antes de unlinkat.
-    if capability_child_has_inode(dir, path, expected) {
-        capability_delete(dir, path)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn capability_rename(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
+fn capability_rename(dir: &File, from: &Path, to: &Path, flag: u32) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let from = capability_name(from)?;
     let to = capability_name(to)?;
-    let rc =
-        unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
+    let rc = unsafe { libc::renameatx_np(
+        dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), flag,
+    ) };
     if rc == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn capability_replace_or_install(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
+    // No hay `inode? -> rename()`: el namespace decide dentro de renameatx_np.
+    // Un canonical previo queda bajo el temporal por RENAME_SWAP y se retiene;
+    // no existe un cleanup pathname que pueda borrar un inode retargeteado.
+    match capability_rename(dir, from, to, libc::RENAME_SWAP) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match capability_rename(dir, from, to, libc::RENAME_EXCL) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists =>
+                    capability_rename(dir, from, to, libc::RENAME_SWAP),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -337,24 +343,17 @@ where
         file.flush()?;
         file.sync_data()?;
         before_rename(&temporary);
-        if !capability_child_has_inode(dir, &temporary, temporary_inode) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "atomic temporary lost its inode before rename",
-            ));
-        }
-        capability_rename(dir, &temporary, path)?;
+        capability_replace_or_install(dir, &temporary, path)?;
         if !capability_child_has_inode(dir, path, temporary_inode) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "atomic target lost its inode after rename",
+                "atomic target did not retain the descriptor-backed temporary",
             ));
         }
         dir.sync_data()
     })();
-    if result.is_err() {
-        let _ = capability_delete_if_same_inode(dir, &temporary, temporary_inode);
-    }
+    // Ante error se retiene el temporal/swap previo para inspección: nunca
+    // `unlinkat` por nombre después de observar una identidad.
     result
 }
 
@@ -910,8 +909,11 @@ mod tests {
             fs::read(root_path.join("temporary-captured")).unwrap(),
             b"captured"
         );
-        assert_eq!(fs::read(replaced.into_inner().unwrap()).unwrap(), b"decoy");
-        assert!(!root_path.join("proof").exists());
+        assert!(!replaced.into_inner().unwrap().exists(),
+            "el temporal decoy fue movido, no borrado por cleanup");
+        assert_eq!(fs::read(root_path.join("proof")).unwrap(), b"decoy");
+        // La publicación detecta que el descriptor creado no llegó al target y
+        // corta; no hay cleanup pathname capaz de borrar el decoy retargeteado.
     }
 
     #[cfg(unix)]
