@@ -322,7 +322,137 @@ fn capability_replace_or_install_with_state(dir: &File, from: &Path, to: &Path) 
 
 #[cfg(unix)]
 fn capability_atomic_write(dir: &File, path: &Path, content: &[u8]) -> io::Result<()> {
-    capability_atomic_write_with_hook(dir, path, content, |_| {})
+    capability_atomic_write_with_hook(dir, path, content, |_, _| {})
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+struct CapabilityAtomicLedger {
+    format: String,
+    target: String,
+    source: String,
+    source_dev: u64,
+    source_ino: u64,
+    old_dev: Option<u64>,
+    old_ino: Option<u64>,
+}
+
+#[cfg(unix)]
+fn capability_atomic_names(path: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    capability_name(path)?;
+    let encoded = path.as_os_str().as_bytes().iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((PathBuf::from(format!(".tantivy-atomic-source-{encoded}")),
+        PathBuf::from(format!(".tantivy-atomic-ledger-{encoded}"))))
+}
+
+#[cfg(unix)]
+fn capability_remove_accredited(
+    dir: &File,
+    path: &Path,
+    expected: (u64, u64),
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let file = capability_open(dir, path, libc::O_RDONLY, 0)?;
+    let metadata = file.metadata()?;
+    if (metadata.dev(), metadata.ino()) != expected || !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            "atomic ledger identity mismatch; file retained"));
+    }
+    if !capability_child_has_inode(dir, path, expected) {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            "atomic ledger name changed; file retained"));
+    }
+    capability_delete(dir, path)?;
+    dir.sync_data()
+}
+
+#[cfg(unix)]
+fn capability_recover_atomic_write(dir: &File, path: &Path) -> io::Result<()> {
+    capability_recover_atomic_write_with_hook(dir, path, &mut |_, _| {})
+}
+
+#[cfg(unix)]
+fn capability_recover_atomic_write_with_hook<F>(
+    dir: &File,
+    path: &Path,
+    hook: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(&str, &Path),
+{
+    use std::os::unix::fs::MetadataExt;
+    let (source, ledger_path) = capability_atomic_names(path)?;
+    let ledger_file = match capability_open(dir, &ledger_path, libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if capability_open(dir, &source, libc::O_RDONLY, 0).is_ok() {
+                return Err(io::Error::new(io::ErrorKind::Other,
+                    "unledgered atomic source retained"));
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let ledger_identity = capability_inode(&ledger_file)?;
+    let metadata = ledger_file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > 1024 {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            "atomic ledger is not an accredited regular file"));
+    }
+    let ledger: CapabilityAtomicLedger = serde_json::from_reader(&ledger_file)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let target = path.to_str().ok_or_else(|| io::Error::new(
+        io::ErrorKind::InvalidInput, "atomic target is not UTF-8"))?;
+    if ledger.format != "tantivy-capability-atomic-v1" || ledger.target != target
+        || ledger.source != source.to_string_lossy()
+        || ledger.old_dev.is_some() != ledger.old_ino.is_some()
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "atomic ledger namespace mismatch; files retained"));
+    }
+    let new_identity = (ledger.source_dev, ledger.source_ino);
+    let old_identity = ledger.old_dev.zip(ledger.old_ino);
+    let target_identity = capability_open(dir, path, libc::O_RDONLY, 0)
+        .and_then(|file| capability_inode(&file)).ok();
+    let source_identity = capability_open(dir, &source, libc::O_RDONLY, 0)
+        .and_then(|file| capability_inode(&file)).ok();
+    if target_identity == old_identity && source_identity == Some(new_identity) {
+        capability_replace_or_install_with_state(dir, &source, path)?;
+        hook("after_swap", &source);
+        dir.sync_data()?;
+        hook("after_swap_fsync", &source);
+    } else if target_identity != Some(new_identity) || match old_identity {
+        Some(old) => source_identity != Some(old) && source_identity.is_some(),
+        None => source_identity.is_some(),
+    } {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            "atomic ledger does not accredit current namespace; files retained"));
+    }
+    let target_identity = capability_open(dir, path, libc::O_RDONLY, 0)
+        .and_then(|file| capability_inode(&file)).ok();
+    let source_identity = capability_open(dir, &source, libc::O_RDONLY, 0)
+        .and_then(|file| capability_inode(&file)).ok();
+    if target_identity != Some(new_identity) {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            "atomic commit lost published source; files retained"));
+    }
+    if let Some(old) = old_identity {
+        if source_identity == Some(old) {
+            capability_remove_accredited(dir, &source, old)?;
+            hook("after_cleanup", &source);
+        } else if source_identity.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Other,
+                "atomic predecessor changed; files retained"));
+        }
+    } else if source_identity.is_some() {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            "unexpected atomic predecessor retained"));
+    }
+    hook("before_ledger_cleanup", &source);
+    capability_remove_accredited(dir, &ledger_path, ledger_identity)
 }
 
 #[cfg(unix)]
@@ -330,61 +460,44 @@ fn capability_atomic_write_with_hook<F>(
     dir: &File,
     path: &Path,
     content: &[u8],
-    before_rename: F,
+    mut hook: F,
 ) -> io::Result<()>
 where
-    F: FnOnce(&Path),
+    F: FnMut(&str, &Path),
 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let temporary = loop {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = PathBuf::from(format!(
-            ".tantivy-atomic-source-{}-{}", std::process::id(), sequence
-        ));
-        match capability_open(dir, &temporary, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600) {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    let (temporary, mut file) = temporary;
+    capability_recover_atomic_write(dir, path)?;
+    let (temporary, ledger_path) = capability_atomic_names(path)?;
+    let mut file = capability_open(
+        dir, &temporary, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600)?;
     let temporary_inode = capability_inode(&file)?;
     let target_before = capability_open(dir, path, libc::O_RDONLY, 0)
         .and_then(|file| capability_inode(&file))
         .ok();
-    let result = (|| {
-        file.write_all(content)?;
-        file.flush()?;
-        file.sync_data()?;
-        before_rename(&temporary);
-        let had_target = capability_replace_or_install_with_state(dir, &temporary, path)?;
-        let target_after = capability_open(dir, path, libc::O_RDONLY, 0)
-            .and_then(|file| capability_inode(&file)).ok();
-        let source_after = capability_open(dir, &temporary, libc::O_RDONLY, 0)
-            .and_then(|file| capability_inode(&file)).ok();
-        let accredited = target_after == Some(temporary_inode)
-            && if had_target { source_after == target_before } else { source_after.is_none() };
-        if !accredited {
-            let restored = if had_target && source_after == target_before {
-                capability_rename(dir, &temporary, path, libc::RENAME_SWAP).is_ok()
-                    && capability_open(dir, path, libc::O_RDONLY, 0)
-                        .and_then(|file| capability_inode(&file)).ok() == target_before
-            } else if !had_target && source_after.is_none() {
-                capability_rename(dir, path, &temporary, libc::RENAME_EXCL).is_ok()
-                    && capability_open(dir, path, libc::O_RDONLY, 0).is_err()
-            } else { false };
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                if restored { "atomic target source was substituted; original restored" }
-                else { "atomic target did not retain the descriptor-backed source" },
-            ));
-        }
-        dir.sync_data()
-    })();
-    // Un error conserva la evidencia de la operación. Los commits exitosos
-    // mantienen como máximo el slot capability `.tantivy-atomic-previous`.
-    result
+    file.write_all(content)?;
+    file.flush()?;
+    file.sync_data()?;
+    let ledger = CapabilityAtomicLedger {
+        format: "tantivy-capability-atomic-v1".into(),
+        target: path.to_str().ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidInput, "atomic target is not UTF-8"))?.into(),
+        source: temporary.to_string_lossy().into_owned(),
+        source_dev: temporary_inode.0,
+        source_ino: temporary_inode.1,
+        old_dev: target_before.map(|identity| identity.0),
+        old_ino: target_before.map(|identity| identity.1),
+    };
+    let mut ledger_file = capability_open(
+        dir, &ledger_path, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+    serde_json::to_writer(&mut ledger_file, &ledger)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    ledger_file.write_all(b"\n")?;
+    ledger_file.sync_data()?;
+    dir.sync_data()?;
+    hook("after_prepare", &temporary);
+    hook("before_rename", &temporary);
+    capability_recover_atomic_write_with_hook(dir, path, &mut hook)?;
+    hook("after_commit", &temporary);
+    Ok(())
 }
 
 impl MmapDirectoryInner {
@@ -925,7 +1038,7 @@ mod tests {
             &root,
             Path::new("proof"),
             b"captured",
-            |temporary| {
+            |point, temporary| if point == "before_rename" {
                 let temporary = root_path.join(temporary);
                 let captured = root_path.join("temporary-captured");
                 *replaced.borrow_mut() = Some(temporary.clone());
@@ -949,7 +1062,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn capability_atomic_write_retiene_sources_no_fijos() {
+    fn capability_atomic_write_acota_sources_y_ledgers() {
         use std::os::unix::fs::OpenOptionsExt;
 
         let root_path = TempDir::new().unwrap();
@@ -977,11 +1090,63 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name().to_string_lossy()
-                    .starts_with(".tantivy-atomic-source-"))
+                    .starts_with(".tantivy-atomic-"))
                 .count(),
-            4,
-            "cada predecessor queda retenido, nunca truncado mediante slot fijo"
+            0,
+            "cada commit consume source y ledger acreditados"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_atomic_write_recupera_crashes_en_cada_frontera() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let boundaries = ["after_prepare", "after_swap", "after_swap_fsync",
+            "after_cleanup", "before_ledger_cleanup"];
+        for boundary in boundaries {
+            let root_path = TempDir::new().unwrap();
+            let root = OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(root_path.path()).unwrap();
+            capability_atomic_write(&root, Path::new("proof"), b"old").unwrap();
+            let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capability_atomic_write_with_hook(&root, Path::new("proof"), b"crashed",
+                    |point, _| if point == boundary { panic!("crash") }).unwrap();
+            }));
+            assert!(crash.is_err(), "la frontera {boundary} no cortó");
+            capability_atomic_write(&root, Path::new("proof"), b"reopened").unwrap();
+            assert_eq!(fs::read(root_path.path().join("proof")).unwrap(), b"reopened");
+            let controls = fs::read_dir(root_path.path()).unwrap().filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy()
+                    .starts_with(".tantivy-atomic-")).count();
+            assert_eq!(controls, 0, "{boundary} dejó controles tras reapertura");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_atomic_write_rechaza_ledger_hardlink_sin_crecer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root_path = TempDir::new().unwrap();
+        let root = OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root_path.path()).unwrap();
+        capability_atomic_write(&root, Path::new("proof"), b"old").unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capability_atomic_write_with_hook(&root, Path::new("proof"), b"new",
+                |point, _| if point == "after_prepare" { panic!("crash") }).unwrap();
+        }));
+        let (_, ledger) = capability_atomic_names(Path::new("proof")).unwrap();
+        fs::hard_link(root_path.path().join(&ledger), root_path.path().join("foreign")).unwrap();
+        for _ in 0..2 {
+            assert!(capability_atomic_write(&root, Path::new("proof"), b"later").is_err());
+            assert_eq!(fs::read(root_path.path().join("proof")).unwrap(), b"old");
+            assert_eq!(fs::read(root_path.path().join("foreign")).unwrap(),
+                fs::read(root_path.path().join(&ledger)).unwrap());
+        }
+        assert_eq!(fs::read_dir(root_path.path()).unwrap().filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy()
+                .starts_with(".tantivy-atomic-")).count(), 2);
     }
 
     #[cfg(unix)]
