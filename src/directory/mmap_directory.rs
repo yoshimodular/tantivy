@@ -303,22 +303,19 @@ fn capability_rename(dir: &File, from: &Path, to: &Path, flag: u32) -> io::Resul
 }
 
 #[cfg(unix)]
-fn capability_replace_or_install(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
-    // No hay `inode? -> rename()`: el namespace decide dentro de renameatx_np.
-    // El temporal vive dentro del dirfd capturado. Cuando SWAP desplaza el
-    // canonical, queda como única generación anterior para reutilizarse en el
-    // siguiente commit: no hay cleanup destructivo por pathname post-swap.
+fn capability_replace_or_install_with_state(dir: &File, from: &Path, to: &Path) -> io::Result<bool> {
     match capability_rename(dir, from, to, libc::RENAME_SWAP) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match capability_rename(dir, from, to, libc::RENAME_EXCL) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    capability_rename(dir, from, to, libc::RENAME_SWAP)
-                }
-                Err(error) => Err(error),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match capability_rename(
+            dir, from, to, libc::RENAME_EXCL,
+        ) {
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                capability_rename(dir, from, to, libc::RENAME_SWAP)?;
+                Ok(true)
             }
-        }
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     }
 }
@@ -338,31 +335,49 @@ fn capability_atomic_write_with_hook<F>(
 where
     F: FnOnce(&Path),
 {
-    // Un único slot estable conserva la generación inmediatamente anterior.
-    // Se abre con el dirfd; si fue renombrado tras abrirse, el descriptor sigue
-    // identificando el mismo inode y la publicación posterior se acredita.
-    let temporary = PathBuf::from(".tantivy-atomic-previous");
-    let mut file = match capability_open(dir, &temporary, libc::O_WRONLY | libc::O_TRUNC, 0) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => capability_open(
-            dir,
-            &temporary,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            0o600,
-        )?,
-        Err(error) => return Err(error),
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temporary = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = PathBuf::from(format!(
+            ".tantivy-atomic-source-{}-{}", std::process::id(), sequence
+        ));
+        match capability_open(dir, &temporary, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     };
+    let (temporary, mut file) = temporary;
     let temporary_inode = capability_inode(&file)?;
+    let target_before = capability_open(dir, path, libc::O_RDONLY, 0)
+        .and_then(|file| capability_inode(&file))
+        .ok();
     let result = (|| {
         file.write_all(content)?;
         file.flush()?;
         file.sync_data()?;
         before_rename(&temporary);
-        capability_replace_or_install(dir, &temporary, path)?;
-        if !capability_child_has_inode(dir, path, temporary_inode) {
+        let had_target = capability_replace_or_install_with_state(dir, &temporary, path)?;
+        let target_after = capability_open(dir, path, libc::O_RDONLY, 0)
+            .and_then(|file| capability_inode(&file)).ok();
+        let source_after = capability_open(dir, &temporary, libc::O_RDONLY, 0)
+            .and_then(|file| capability_inode(&file)).ok();
+        let accredited = target_after == Some(temporary_inode)
+            && if had_target { source_after == target_before } else { source_after.is_none() };
+        if !accredited {
+            let restored = if had_target && source_after == target_before {
+                capability_rename(dir, &temporary, path, libc::RENAME_SWAP).is_ok()
+                    && capability_open(dir, path, libc::O_RDONLY, 0)
+                        .and_then(|file| capability_inode(&file)).ok() == target_before
+            } else if !had_target && source_after.is_none() {
+                capability_rename(dir, path, &temporary, libc::RENAME_EXCL).is_ok()
+                    && capability_open(dir, path, libc::O_RDONLY, 0).is_err()
+            } else { false };
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "atomic target did not retain the descriptor-backed temporary",
+                if restored { "atomic target source was substituted; original restored" }
+                else { "atomic target did not retain the descriptor-backed source" },
             ));
         }
         dir.sync_data()
@@ -924,18 +939,17 @@ mod tests {
             fs::read(root_path.join("temporary-captured")).unwrap(),
             b"captured"
         );
-        assert!(
-            !replaced.into_inner().unwrap().exists(),
-            "el temporal decoy fue movido, no borrado por cleanup"
-        );
-        assert_eq!(fs::read(root_path.join("proof")).unwrap(), b"decoy");
-        // La publicación detecta que el descriptor creado no llegó al target y
-        // corta; no hay cleanup pathname capaz de borrar el decoy retargeteado.
+        assert_eq!(fs::read(replaced.into_inner().unwrap()).unwrap(), b"decoy",
+            "el decoy queda retenido; rollback no lo borra por pathname");
+        assert!(!root_path.join("proof").exists(),
+            "el target originalmente ausente se restaura ausente tras retarget");
+        // La publicación detecta que el descriptor creado no llegó al target,
+        // revierte el namespace y no borra el decoy retargeteado.
     }
 
     #[cfg(unix)]
     #[test]
-    fn capability_atomic_write_bounds_retired_generations() {
+    fn capability_atomic_write_retiene_sources_no_fijos() {
         use std::os::unix::fs::OpenOptionsExt;
 
         let root_path = TempDir::new().unwrap();
@@ -959,18 +973,14 @@ mod tests {
             b"generation-4"
         );
         assert_eq!(
-            fs::read(root_path.path().join(".tantivy-atomic-previous")).unwrap(),
-            b"generation-3",
-            "sólo se conserva el predecessor inmediato para el siguiente commit"
-        );
-        assert_eq!(
             fs::read_dir(root_path.path())
                 .unwrap()
                 .filter_map(Result::ok)
-                .filter(|entry| entry.file_name() == ".tantivy-atomic-previous")
+                .filter(|entry| entry.file_name().to_string_lossy()
+                    .starts_with(".tantivy-atomic-source-"))
                 .count(),
-            1,
-            "N commits exitosos siguen acotados a un único slot capability"
+            4,
+            "cada predecessor queda retenido, nunca truncado mediante slot fijo"
         );
     }
 
