@@ -286,9 +286,15 @@ fn capability_rename(dir: &File, from: &Path, to: &Path, flag: u32) -> io::Resul
     use std::os::unix::io::AsRawFd;
     let from = capability_name(from)?;
     let to = capability_name(to)?;
-    let rc = unsafe { libc::renameatx_np(
-        dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), flag,
-    ) };
+    let rc = unsafe {
+        libc::renameatx_np(
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            flag,
+        )
+    };
     if rc == 0 {
         Ok(())
     } else {
@@ -297,17 +303,20 @@ fn capability_rename(dir: &File, from: &Path, to: &Path, flag: u32) -> io::Resul
 }
 
 #[cfg(unix)]
-fn capability_replace_or_install(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
+/// Returns whether `RENAME_SWAP` displaced a previous canonical generation.
+fn capability_replace_or_install(dir: &File, from: &Path, to: &Path) -> io::Result<bool> {
     // No hay `inode? -> rename()`: el namespace decide dentro de renameatx_np.
-    // Un canonical previo queda bajo el temporal por RENAME_SWAP y se retiene;
-    // no existe un cleanup pathname que pueda borrar un inode retargeteado.
+    // El temporal es un nombre privado creado con O_EXCL desde este mismo dirfd.
+    // Si swap desplaza el canonical, el llamador lo retira directamente mediante
+    // ese dirfd: no hay `stat() -> unlink()` sobre un pathname observado.
     match capability_rename(dir, from, to, libc::RENAME_SWAP) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             match capability_rename(dir, from, to, libc::RENAME_EXCL) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists =>
-                    capability_rename(dir, from, to, libc::RENAME_SWAP),
+                Ok(()) => Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    capability_rename(dir, from, to, libc::RENAME_SWAP).map(|()| true)
+                }
                 Err(error) => Err(error),
             }
         }
@@ -343,17 +352,24 @@ where
         file.flush()?;
         file.sync_data()?;
         before_rename(&temporary);
-        capability_replace_or_install(dir, &temporary, path)?;
+        let displaced_canonical = capability_replace_or_install(dir, &temporary, path)?;
         if !capability_child_has_inode(dir, path, temporary_inode) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "atomic target did not retain the descriptor-backed temporary",
             ));
         }
+        // Sólo tras acreditar el nuevo canonical se retira la generación
+        // desplazada. `temporary` sigue siendo el nombre privado de esta
+        // operación dentro del dirfd capturado; la retirada no reabre ni
+        // comprueba ese pathname antes de unlinkat.
+        if displaced_canonical {
+            capability_delete(dir, &temporary)?;
+        }
         dir.sync_data()
     })();
-    // Ante error se retiene el temporal/swap previo para inspección: nunca
-    // `unlinkat` por nombre después de observar una identidad.
+    // Un error conserva la evidencia de la operación; las mutaciones exitosas
+    // no acumulan generaciones `.tantivy-atomic-*`.
     result
 }
 
@@ -909,11 +925,52 @@ mod tests {
             fs::read(root_path.join("temporary-captured")).unwrap(),
             b"captured"
         );
-        assert!(!replaced.into_inner().unwrap().exists(),
-            "el temporal decoy fue movido, no borrado por cleanup");
+        assert!(
+            !replaced.into_inner().unwrap().exists(),
+            "el temporal decoy fue movido, no borrado por cleanup"
+        );
         assert_eq!(fs::read(root_path.join("proof")).unwrap(), b"decoy");
         // La publicación detecta que el descriptor creado no llegó al target y
         // corta; no hay cleanup pathname capaz de borrar el decoy retargeteado.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_atomic_write_bounds_retired_generations() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root_path = TempDir::new().unwrap();
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root_path.path())
+            .unwrap();
+
+        for generation in 0..5 {
+            capability_atomic_write(
+                &root,
+                Path::new("proof"),
+                format!("generation-{generation}").as_bytes(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            fs::read(root_path.path().join("proof")).unwrap(),
+            b"generation-4"
+        );
+        assert_eq!(
+            fs::read_dir(root_path.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tantivy-atomic-"))
+                .count(),
+            0,
+            "cada commit exitoso retira directamente su generación desplazada"
+        );
     }
 
     #[cfg(unix)]
