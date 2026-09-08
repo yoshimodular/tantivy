@@ -267,6 +267,35 @@ fn capability_delete(dir: &File, path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn capability_inode(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn capability_child_has_inode(dir: &File, path: &Path, expected: (u64, u64)) -> bool {
+    capability_open(dir, path, libc::O_RDONLY, 0)
+        .and_then(|file| capability_inode(&file))
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn capability_delete_if_same_inode(
+    dir: &File,
+    path: &Path,
+    expected: (u64, u64),
+) -> io::Result<()> {
+    // Un cleanup no puede borrar un temporal cuyo nombre ya fue retargeteado.
+    // La identidad se vuelve a acreditar justo antes de unlinkat.
+    if capability_child_has_inode(dir, path, expected) {
+        capability_delete(dir, path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn capability_rename(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let from = capability_name(from)?;
@@ -282,6 +311,19 @@ fn capability_rename(dir: &File, from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn capability_atomic_write(dir: &File, path: &Path, content: &[u8]) -> io::Result<()> {
+    capability_atomic_write_with_hook(dir, path, content, |_| {})
+}
+
+#[cfg(unix)]
+fn capability_atomic_write_with_hook<F>(
+    dir: &File,
+    path: &Path,
+    content: &[u8],
+    before_rename: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path),
+{
     let temporary = PathBuf::from(format!(".tantivy-atomic-{}", uuid::Uuid::new_v4()));
     let mut file = capability_open(
         dir,
@@ -289,15 +331,29 @@ fn capability_atomic_write(dir: &File, path: &Path, content: &[u8]) -> io::Resul
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         0o600,
     )?;
+    let temporary_inode = capability_inode(&file)?;
     let result = (|| {
         file.write_all(content)?;
         file.flush()?;
         file.sync_data()?;
+        before_rename(&temporary);
+        if !capability_child_has_inode(dir, &temporary, temporary_inode) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "atomic temporary lost its inode before rename",
+            ));
+        }
         capability_rename(dir, &temporary, path)?;
+        if !capability_child_has_inode(dir, path, temporary_inode) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "atomic target lost its inode after rename",
+            ));
+        }
         dir.sync_data()
     })();
     if result.is_err() {
-        let _ = capability_delete(dir, &temporary);
+        let _ = capability_delete_if_same_inode(dir, &temporary, temporary_inode);
     }
     result
 }
@@ -818,6 +874,44 @@ mod tests {
         symlink(&sentinel, captured.join("poison")).unwrap();
         assert!(directory.atomic_read(Path::new("poison")).is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_atomic_write_preserves_retargeted_temporary() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let parent = TempDir::new().unwrap();
+        let root_path = parent.path().join("index");
+        fs::create_dir(&root_path).unwrap();
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&root_path)
+            .unwrap();
+
+        let replaced = RefCell::new(None);
+        let result = capability_atomic_write_with_hook(
+            &root,
+            Path::new("proof"),
+            b"captured",
+            |temporary| {
+                let temporary = root_path.join(temporary);
+                let captured = root_path.join("temporary-captured");
+                *replaced.borrow_mut() = Some(temporary.clone());
+                fs::rename(&temporary, &captured).unwrap();
+                fs::write(&temporary, b"decoy").unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(root_path.join("temporary-captured")).unwrap(),
+            b"captured"
+        );
+        assert_eq!(fs::read(replaced.into_inner().unwrap()).unwrap(), b"decoy");
+        assert!(!root_path.join("proof").exists());
     }
 
     #[cfg(unix)]
